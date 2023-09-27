@@ -1,0 +1,9 @@
+{
+  "version": "0.0.0",
+  "devDependencies": {
+    "@types/node": "^20.7.0"
+  },
+  "dependencies": {
+    "undici": "^5.25.2"
+  }
+}
