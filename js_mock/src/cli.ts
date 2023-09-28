@@ -8,54 +8,49 @@ let uid: string | undefined;
 let addr = '198.168.0.0';
 const files: string[] = []
 
-for (let i = 0; i < argv.length; ++i) {
-  const arg = argv[i];
-  switch (arg) {
-    case '-p':
-    case '--port': {
-      if (i == argv.length) {
-        console.error('--port expects 1 argument, got 0');
-        process.exit(1);
+/* namespace CollectArgs */ {
+  /** @pure */
+  function expect_one(name: string, i: number) {
+    if (i == argv.length) {
+      console.error(`--${name} expects 1 argument, got 0`);
+      process.exit(1);
+    }
+  }
+
+  for (let i = 0; i != argv.length; ++i) {
+    const arg = argv[i];
+    switch (arg) {
+      case '-p':
+      case '--port': {
+        expect_one('port', i);
+        port = argv[++i];
+        break;
       }
 
-      const next = argv[++i];
-      port = next;
-      break;
-    }
-
-    case '-a':
-    case '--address': {
-      if (i == argv.length) {
-        console.error('--address expects 1 argument, got 0');
-        process.exit(1);
+      case '-a':
+      case '--address': {
+        expect_one('address', i);
+        addr = argv[++i];
+        break;
       }
 
-      const next = argv[++i];
-      addr = next;
-      break;
-    }
-
-    case '-u':
-    case '--user': {
-      if (i == argv.length) {
-        console.error('--user expects 1 argument, got 0');
-        process.exit(1);
+      case '-u':
+      case '--user': {
+        expect_one('user', i);
+        uid = argv[++i];
+        break;
       }
 
-      const next = argv[++i];
-      uid = next;
-      break;
-    }
-
-    default: {
-      // file paths expected
-      files.push(arg);
-      break;
+      default: {
+        // file paths expected
+        files.push(arg);
+        break;
+      }
     }
   }
 }
 
-{
+/* namespace PromptBadFiles */ {
   // check if files readable in a parallel, non-blocking way
   const not_exist: string[] = [];
   const resolves = files.map(f =>
@@ -78,4 +73,3 @@ if (undefined == port) {
   console.error('--port is a required argument');
   process.exit(1);
 }
-
