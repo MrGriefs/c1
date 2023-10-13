@@ -3,8 +3,40 @@ import path from 'node:path';
 import http from 'node:http';
 import { Buffer, btoa } from 'node:buffer';
 import process from 'node:process';
+import { Fs } from './Util';
+import { setTimeout } from 'node:timers/promises';
+import assert from 'node:assert';
 
 await DropServer.Session.init();
+
+// ensure system group. the system group is used to store admin users
+{
+  const system_id = 'system' as DropServer.Session.Id;
+  if (!DropServer.Session.exists(system_id)) {
+    await DropServer.Session.create(system_id, 'system');
+  }
+
+  DropServer.Session.system = DropServer.Session.get(system_id);
+}
+
+// save persistent config ever 1 hour to 1 hour 30 minutes
+{
+  function random_delay() {
+    // a random interval between 0ms to 30 minutes
+    // this will add some extra security as an attacker cannot easily predict when files are being written
+    const interval = Math.ceil(Math.random() * 1_000 * 60 * 30);
+    const hour = 1_000 * 60 * 60;
+
+    return hour + interval;
+  }
+
+  function save_scheduler() {
+    DropServer.Session.save();
+    setTimeout(random_delay(), save_scheduler);
+  }
+
+  setTimeout(random_delay(), save_scheduler);
+}
 
 export namespace DropServer.Constants {
   export namespace Headers {
@@ -38,22 +70,6 @@ export namespace DropServer {
   }
 
   export const store = path.join(process.cwd(), 'data');
-
-  export namespace Admin {
-    const admin_map = new Set<string>();
-
-    export function add(username: string) {
-      admin_map.add(username);
-    }
-
-    export function remove(username: string) {
-      admin_map.delete(username);
-    }
-
-    export function exists(username: string) {
-      return admin_map.has(username);
-    }
-  }
 
   export namespace FileStore {
     export async function getUserDataFromState(store: string) {
@@ -118,28 +134,59 @@ export namespace DropServer {
 export namespace DropServer.Session {
   export type Id = string & { __TYPE__: Id };
   export type Info = {
+    id: Id;
     created: number;
     author: string;
     disabled: boolean;
+    users: Map<string, string>;
   }
 
   export const SESSION_OLD_AFTER_DURATION = 24 * 60 * 60 * 1_000;
+  export const system: Info;
 
   const sessions = new Map<Id, Info>();
+  const location = path.join(store, 'sessions.json');
 
   export var init = async () => {
     init = null
-    const raw_sessions = JSON.parse(await fs.readFile(path.join(store, 'sessions.json'), 'utf8'));
-    
-    const min_date = new Date().valueOf() - SESSION_OLD_AFTER_DURATION;
-    for (const raw_session of raw_sessions) {
-      const created = new Date(raw_session.created).valueOf();
 
-      sessions.set(raw_session.id, {
-        created,
-        author: raw_session.author,
-        disabled: raw_session.disabled || created > min_date,
-      });
+    // ensure file system state
+    await fs.mkdir(path.join(store, 'sessions_backups')).catch(Fs.ignore_eexist);
+
+    const sessions: Info[] = JSON.parse(await fs.readFile(location, 'utf8'));
+
+    const promises: Promise<any>[] = [];
+    const min_date = new Date().valueOf() - SESSION_OLD_AFTER_DURATION;
+    for (const session of sessions) {
+      const created = new Date(session.created).valueOf();
+
+      session.disabled ||= created > min_date;
+
+      if (session.disabled === false) {
+        session.users = new Map() as Info['users'];
+
+        promises.push(
+          (async () => {
+            for await (const [uid, cred] of read_users(session.id))
+              session.users.set(uid, cred);
+          })(),
+        );
+      }
+
+      sessions.set(session.id, session);
+    }
+
+    await Promise.all(promises);
+  }
+
+  export async function* read_users(session_id: Id) {
+    const ents = await fs.readdir(path.join(store, session_id), { withFileTypes: true });
+
+    for (const ent of ents) {
+      const parts = ent.name.split(':');
+      assert(parts.length == 2);
+
+      yield parts;
     }
   }
 
@@ -147,9 +194,11 @@ export namespace DropServer.Session {
     await fs.mkdir(path.join(store, id));
 
     sessions.set(id, {
+      id,
       created: new Date().valueOf(),
       author: author,
       disabled: false,
+      users: new Map(),
     });
   }
 
@@ -169,6 +218,27 @@ export namespace DropServer.Session {
 
   export async function exists(id: Id) {
     return sessions.has(id);
+  }
+
+  export async function save() {
+    await fs.rename(location, path.join(store, 'sessions_backups', `sessions_${new Date().toISOString()}.json`));
+    await fs.writeFile(location, JSON.stringify(sessions.values()), 'utf8');
+  }
+}
+
+export namespace DropServer.Admin {
+  const admin_map = new Map<string, string>();
+
+  export function add(username: string, credentials: string) {
+    admin_map.add(username);
+  }
+
+  export function delete(username: string) {
+    DropServer.Session.system.users.delete(username)l
+  }
+
+  export function is(username: string, credentials: string) {
+    return DropServer.Session.system.users.get(username) === credentials;
   }
 }
 
@@ -235,8 +305,16 @@ export namespace DropServer.Tasks {
   }
 
   export namespace Upload {
-    export function POST(req: http.IncomingMessage, res: http.ServerResponse) {
-      const path = assertFilePath(req, res);
+    export function POST(ctx: Context) {
+      assertAuth(ctx);
+      assertSessionId(ctx);
+      assertFilePath(ctx);
+
+      const { req, res, auth, session_id, file_path } = ctx;
+
+      const session = DropServer.Session.get(session_id);
+      session.
+
       let body = '';
       req
         .on('data', data => void (body += data))
