@@ -1,9 +1,19 @@
+// configured from https://www.typescriptlang.org/tsconfig
 {
-    "compilerOptions": {
-        "esModuleInterop": true,
-        "target": "esnext",
-        "module": "esnext",
-        "moduleResolution": "node"
-    },
-    "include": ["src/**/*"]
+  "compilerOptions": {    
+    // modules
+    "module": "esnext",
+    "moduleResolution": "node",
+    
+    // interop constraints
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "verbatimModuleSyntax": true,
+
+    // language and environment
+    "target": "esnext",
+  },
+  "include": [
+    "src/**/*"
+  ]
 }

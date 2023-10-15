@@ -1,6 +1,9 @@
 {
   "version": "0.0.0",
   "type": "module",
+  "scripts": {
+    "ssl-create": "sh ./scripts/ssl-create"
+  },
   "devDependencies": {
     "@types/node": "^20.7.0"
   },

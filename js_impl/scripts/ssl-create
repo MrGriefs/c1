@@ -1,0 +1,19 @@
+#!/bin/sh
+
+mkdir .ssl &&
+certbot certonly \
+  --manual --preferred-challenges dns \
+  -m admin@hyena.gay -d priv-c1.hyena.gay \
+  &&
+openssl dhparam -out ./.ssl/dh1.pem 2048 &&
+
+if [ $OSTYPE == 'msys' ]; then
+  # windows msys ba/sh emulation support
+  ln -s -T 'C:\Certbot\live\priv-c1.hyena.gay\fullchain.pem' ./.ssl/cert.pem
+  ln -s -T 'C:\Certbot\live\priv-c1.hyena.gay\privkey.pem' ./.ssl/key.pem
+  ln -s -T 'C:\Certbot\live\priv-c1.hyena.gay\chain.pem' ./.ssl/ca.pem
+else
+  ln -s -T /etc/letsencrypt/archive/fullchain.pem ./.ssl/cert.pem
+  ln -s -T /etc/letsencrypt/archive/privkey.pem ./.ssl/key.pem
+  ln -s -T /etc/letsencrypt/archive/chain.pem ./.ssl/ca.pem
+fi
