@@ -4,7 +4,8 @@ export type Session = {
   created: Date;
   author: string;
   disabled: boolean;
-  users: Map<string, string>;
+  // users should never be directly written to
+  users: ReadonlyMap<string, string>;
 }
 export namespace Session {
   export type Uuid = `${string}-${string}-${string}-${string}-${string}` & { __TYPE__: Uuid };

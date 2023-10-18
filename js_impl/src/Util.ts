@@ -1,5 +1,18 @@
 import type { AddressInfo } from 'node:net';
 
+/**
+ * "I Only Need O from T"  
+ * 
+ * type generic to make all fields of an object of type T optional except O fields.  
+ * useful if you have a function that only require fields x, but not y or z,
+ * without blocking the function user from using the same object of type T as the parameter.
+ */
+export type Only<T, O extends keyof T> = Required<Pick<T, O>> & Partial<Omit<T, O>>;
+
+export function exhaust_match(_: never): Error {
+  return new Error(`unexpected: ${_}`);
+}
+
 export namespace Fs {
   export function ignore_eexist(error) {
     if (error.code !== 'EEXIST') throw error;

@@ -19,12 +19,14 @@ import process from 'node:process';
 import { setTimeout } from 'node:timers/promises';
 import assert from 'node:assert';
 import type * as Type from './types';
-import { Fs, Net } from './Util.js';
+import { Fs, Net, exhaust_match, type Only } from './Util.js';
 import { randomUUID } from 'node:crypto';
 import constants from 'node:constants';
 
 // enforces all date strings to be in UTC time
 process.env.TZ = 'UTC';
+
+await DropServer.Session.load_state();
 
 { // save persistent config ever 1 hour to 1 hour 30 minutes
   function random_delay() {
@@ -71,7 +73,7 @@ export namespace DropServer {
   };
   export namespace Context {
     export type Auth = { user: Type.User; };
-    export type SessionId = { session_id: Type.Session.Uuid; };
+    export type Session = { session: Readonly<Type.Session>; };
     export type FilePath = { file_path: string; };
   }
 
@@ -101,30 +103,15 @@ export namespace DropServer {
   }
 }
 
-export namespace DropServer.Admin {
-  export function add({ name, auth }: Type.User) {
-    DropServer.Session.system.users.set(name, auth);
-  }
-
-  export function remove(username: string) {
-    DropServer.Session.system.users.delete(username);
-  }
-
-  export function is({ name, auth }: Type.User) {
-    // offensive programming (if credentials were undefined, this function would
-    // return true if the username doesn't exist - opening an exploit)
-    assert(auth !== undefined);
-    return DropServer.Session.system.users.get(name) === auth;
-  }
-}
-
 export namespace DropServer.Session {
   export const SESSION_OLD_AFTER_DURATION = 24 * 60 * 60 * 1_000;
 
   const sessions = new Map<Type.Session['uuid'], Type.Session>();
   const location = path.join(store, 'sessions.json');
 
-  namespace _ {
+  export let system: Type.Session | null = null;
+
+  export async function load_state() {
     // ensure file system state
     await fs.mkdir(path.join(store, 'sessions_backups')).catch(Fs.ignore_eexist);
 
@@ -141,12 +128,12 @@ export namespace DropServer.Session {
 
       // pre-cache users of active User Groups
       if (raw.disabled === false) {
-        raw.users = new Map() as Type.Session['users'];
+        raw.users = new Map();
 
         promises.push(
           (async () => {
             for await (const [uid, cred] of read_users(raw.uuid))
-              raw.users.set(uid, cred);
+              (raw.users as Map<string, string>).set(uid, cred);
           })(),
         );
       }
@@ -155,18 +142,18 @@ export namespace DropServer.Session {
     }
 
     await Promise.all(promises);
-  }
-    
-  // ensure system group. the system group is used to store admin users
-  const system_uuid = '00000000-0000-0000-0000-000000000000' as Type.Session['uuid'];
-  if (!DropServer.Session.exists(system_uuid))
-    await DropServer.Session.create({
-      uuid: system_uuid,
-      author: 'system',
-      name: 'System',
-    });
 
-  export const system: Type.Session = DropServer.Session.get(system_uuid);
+    // ensure system group. the system group is used to store admin users
+    const system_uuid = '00000000-0000-0000-0000-000000000000' as Type.Session['uuid'];
+    if (!DropServer.Session.exists(system_uuid))
+      await DropServer.Session.create({
+        uuid: system_uuid,
+        author: 'system',
+        name: 'System',
+      });
+
+    system = DropServer.Session.get(system_uuid);
+  }
 
   export async function* read_users(session_id: Type.Session.Uuid) {
     const ents = await fs.readdir(path.join(store, session_id), { withFileTypes: true });
@@ -196,7 +183,8 @@ export namespace DropServer.Session {
     return sessions.get(id);
   }
 
-  export function update(session: Readonly<Type.Session>): Type.Session {
+  // type cast for more verbose mutation
+  export function mutate(session: Readonly<Type.Session>): Type.Session {
     return session; // noop
   }
 
@@ -220,7 +208,85 @@ export namespace DropServer.Session {
   }
 }
 
+export namespace DropServer.Session.User {
+  type WritableMap = Map<string, string>;
+  export function add(session: Type.Session, { name, auth }: Type.User) {
+    // offensive programming: don't trust all uses of this function to be sequential/synchronous
+    assert(!session.users.has(name));
+    (session.users as WritableMap).set(name, auth);
+  }
+
+  export function remove(session: Type.Session, { name, auth }: Type.User) {
+    const auth2 = session.users.get(name);
+    assert(auth2 !== undefined && auth2 === auth);
+    (session.users as WritableMap).delete(name);
+  }
+
+  /** remove a user without the user's credentials, i.e. an admin removing a user on their behalf */
+  export function unsafe_remove(session: Type.Session, { name }: Only<Type.User, 'name'>) {
+    assert(session.users.has(name));
+    (session.users as WritableMap).delete(name);
+  }
+
+  export function is(session: Type.Session, { name, auth }: Type.User) {
+    // offensive programming (if credentials were undefined, this function would
+    // return true if the username doesn't exist - opening an exploit)
+    assert(auth !== undefined);
+    return session.users.get(name) === auth;
+  }
+
+  export enum Qualify {
+    /** user does not exist */
+    NO_USER,
+    /** user exists, credentials match */
+    IS_USER,
+    /** user exists, credentials do not match */
+    BAD_AUTH,
+  }  
+
+  /** returns the enum for authentication the user has (authenticity qualification) */
+  export function qualify(session: Type.Session, { name, auth }: Type.User) {
+    assert(auth !== undefined);
+    const auth2 = session.users.get(name);
+    
+    switch (auth2) {
+      case undefined:
+        return Qualify.NO_USER;
+      case auth:
+        return Qualify.IS_USER;
+      default:
+        return Qualify.BAD_AUTH;
+    }
+  }
+}
+
+export namespace DropServer.Admin {
+  // shortcut functions
+
+  export function add(user: Type.User) {
+    DropServer.Session.User.add(DropServer.Session.system, user);
+  }
+
+  export function remove(user: Type.User) {
+    DropServer.Session.User.remove(DropServer.Session.system, user);
+  }
+
+  export function is(user: Type.User) {
+    return DropServer.Session.User.is(DropServer.Session.system, user);
+  }
+}
+
+// 2x faster than 'await'ing individually/sequentially (see perf/readfile-concurrency)
+const _DropServer_stack = await Promise.all([
+  fs.readFile('./.ssl/ca.pem'),
+  fs.readFile('./.ssl/dh1.pem'),
+  fs.readFile('./.ssl/cert.pem'),
+  fs.readFile('./.ssl/key.pem'),
+]);
+
 export namespace DropServer {
+  // see https://github.com/microsoft/TypeScript/issues/53715
+  const stack = _DropServer_stack;
   const api_map = {
     '/files': {
       'POST': Tasks.Upload.POST,
@@ -229,14 +295,6 @@ export namespace DropServer {
       'POST': Tasks.Session.POST,
     },
   } as const;
-
-  // 2x faster than 'await'ing individually/sequentially (see perf/readfile-concurrency)
-  const stack = await Promise.all([
-    fs.readFile('./.ssl/ca.pem'),
-    fs.readFile('./.ssl/dh1.pem'),
-    fs.readFile('./.ssl/cert.pem'),
-    fs.readFile('./.ssl/key.pem'),
-  ]);
 
   export const server = https.createServer({
     // see https://nodejs.org/api/tls.html#tlscreatesecurecontextoptions
@@ -303,6 +361,8 @@ export namespace DropServer {
 }
 
 export namespace DropServer.Tasks {
+  import User = DropServer.Session.User;
+
   function assertFilePath(ctx: Context): asserts ctx is Context & Context.FilePath {
     const { req, res } = ctx;
     const path = req.headers[DropServer.Constants.Headers.XFilePath];
@@ -320,7 +380,7 @@ export namespace DropServer.Tasks {
     (ctx as Context & Context.FilePath).file_path = path;
   }
 
-  function assertSessionId(ctx: Context): asserts ctx is Context & Context.SessionId {
+  function assertSessionId(ctx: Context): Type.Session.Uuid {
     const { req, res } = ctx;
     const session = req.headers[DropServer.Constants.Headers.XSessionId];
 
@@ -329,7 +389,21 @@ export namespace DropServer.Tasks {
         .writeHead(400)
         .end();
 
-    (ctx as Context & Context.SessionId).session_id = session as Type.Session.Uuid;
+    return session as Type.Session.Uuid;
+  }
+
+  function assertSession(ctx: Context): asserts ctx is Context & Context.Session {
+    const { res } = ctx;
+    
+    const uuid = assertSessionId(ctx);
+    const session = DropServer.Session.get(uuid);
+
+    if (session === undefined)
+      return void res
+        .writeHead(400) // 404? resource was found, but not object
+        .end('{"message":"Session does not exist"}');
+
+    (ctx as Context & Context.Session).session = session;
   }
 
   /** this asserts the existence of authorisation, it does NOT assert authentication validity */
@@ -368,6 +442,27 @@ export namespace DropServer.Tasks {
       throw void res
         .writeHead(403)
         .end();
+  }
+
+  function assertAuthAsUser({ res, user, session }: Context & Context.Auth & Context.Session) {
+    const _ = User.qualify(session, user);
+    switch (_) {
+      // force typescript to error if this match doesn't include all enum cases
+      default: throw exhaust_match(_);
+
+      case User.Qualify.BAD_AUTH:
+        throw void res
+          .writeHead(401)
+          .end();
+
+      case User.Qualify.NO_USER:
+        // create the user
+        User.add(session, user);
+        break;
+
+      case User.Qualify.IS_USER:
+        break; // continue
+    }
   }
 
   export namespace Upload {
@@ -440,19 +535,18 @@ export namespace DropServer.Tasks {
 
     export async function PATCH(ctx: Context) {
       assertAuth(ctx);
-      assertAuthIsAdmin(ctx);
-      assertSessionId(ctx);
+      assertAuthIsAdmin(ctx); // is admin, don't need to authenticate
+      assertSession(ctx);
 
-      const { req, res, user: auth, session_id } = ctx;
+      const { req, res, session } = ctx;
 
       // io cannot be asynchronous. this queue prevents race conditoons where the directory is deleted after checking it exists
       queue
         .then(async () => {
-          const session = DropServer.Session.get(session_id);
-          if (session === undefined)
+          if (!DropServer.Session.exists(session.uuid))
             return void res
-              .writeHead(400) // 404? resource was found, but not object
-              .end('{"message":"Session does not exist"}');
+              .writeHead(500) // should resource race be 500???
+              .end('{"message":"Session deleted before operation"}');
           
           let body = '';
           req
@@ -487,9 +581,10 @@ export namespace DropServer.Tasks {
               // evaluate
               for (const key of keys) {
                 const val = json[key];
+                const mut_session = DropServer.Session.mutate(session);
                 switch (key) {
                   case 'disabled':
-                    session.disabled = val;
+                    mut_session.disabled = val;
                     break;
 
                   default: throw Error('offensive programming');
