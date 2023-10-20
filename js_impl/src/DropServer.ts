@@ -166,7 +166,12 @@ export namespace DropServer.Session {
     }
   }
 
-  export async function create({ uuid, author, name }: Pick<Type.Session, 'uuid' | 'author' | 'name'>): Promise<void> {
+  export async function create(
+    { uuid, author, name, disabled = false }:
+      & Required<Pick<Type.Session, 'uuid' | 'author' | 'name'>>
+      & Partial<Pick<Type.Session, 'disabled'>>
+  ): Promise<void> {
+    assert(Session.exists(uuid) === false); // offensive programming
     await fs.mkdir(path.join(store, uuid));
 
     sessions.set(uuid, {
@@ -174,7 +179,7 @@ export namespace DropServer.Session {
       name,
       author,
       created: new Date(),
-      disabled: false,
+      disabled,
       users: new Map() as Type.Session['users'],
     });
   }
@@ -188,7 +193,7 @@ export namespace DropServer.Session {
     return session; // noop
   }
 
-  export async function is_disabled(session: Type.Session) {
+  export function is_disabled(session: Type.Session): true | false {
     if (session.disabled === true)
       return true;
 
@@ -198,7 +203,7 @@ export namespace DropServer.Session {
     return false;
   }
 
-  export async function exists(id: Type.Session.Uuid) {
+  export function exists(id: Type.Session.Uuid) {
     return sessions.has(id);
   }
 
@@ -228,11 +233,14 @@ export namespace DropServer.Session.User {
     (session.users as WritableMap).delete(name);
   }
 
-  export function is(session: Type.Session, { name, auth }: Type.User) {
-    // offensive programming (if credentials were undefined, this function would
-    // return true if the username doesn't exist - opening an exploit)
-    assert(auth !== undefined);
-    return session.users.get(name) === auth;
+  export function is(session: Type.Session, { name, auth }: Type.User): true | false {
+    switch (session.users.get(name)) {
+      // offensive programming (if credentials were undefined, this function would
+      // return true if the username doesn't exist - opening an exploit)
+      case undefined: throw Error('user does not exist (raced?)');
+      case auth: return true;
+      default: return false;
+    }
   }
 
   export enum Qualify {
@@ -398,10 +406,10 @@ export namespace DropServer.Tasks {
     const uuid = assertSessionId(ctx);
     const session = DropServer.Session.get(uuid);
 
-    if (session === undefined)
+    if (session === undefined || DropServer.Session.is_disabled(session))
       return void res
-        .writeHead(400) // 404? resource was found, but not object
-        .end('{"message":"Session does not exist"}');
+        .writeHead(404)
+        .end('{"message":"Session does not exist or is disabled"}');
 
     (ctx as Context & Context.Session).session = session;
   }
@@ -464,20 +472,68 @@ export namespace DropServer.Tasks {
         break; // continue
     }
   }
+  
+  function assertJson({ res }: Context, body: string): object {
+    try {
+      return JSON.parse(body);
+    } catch {
+      return void res
+        .writeHead(400)
+        .end();
+    }
+  }
+
+  function assertValidSchema({ res }: Context, map: object, keys: string[], length: number): void {
+    // (defensive programming) ensure json does not have more than the expected amount of keys before iterating
+    if (keys.length > length)
+      return void res
+        .writeHead(400)
+        .end();
+    
+    // validate
+    for (const key of keys) {
+      if (key in map && typeof key === map[key]) continue;
+
+      return void res
+        .writeHead(400)
+        .end();
+    }
+  }
+
+  function assertPatchSchemaSanitised({ res }: Context, json: Session.Patch.Schema, keys: (keyof typeof Session.Patch.Schema.map)[]) {
+    for (const key of keys) {
+      switch (key) {
+        case 'name': {
+          let v = json[key];
+          if (v.length > 32)
+            return void res
+              .writeHead(400)
+              .end('{"message":"\'name\' must not exceed 32 characters"}');
+
+          v = v.normalize('NFC'); // decrease string length by normaling chars
+          let rebuilt = '';
+          for (let i = 0; i != v.length; ++i) {
+            if (v.charCodeAt(i) < 20) continue;
+            rebuilt = rebuilt + v[i];
+          }
+
+          if (rebuilt.length === 0)
+            return void res
+              .writeHead(400)
+              .end('{"message":"\'name\' must be at least 1 character in length"}');
+        }
+      }
+    }
+  }
 
   export namespace Upload {
     export function POST(ctx: Context) {
       assertAuth(ctx);
-      assertSessionId(ctx);
       assertFilePath(ctx);
+      assertSession(ctx);
+      assertAuthAsUser(ctx);
 
-      const { req, res, user, session_id, file_path } = ctx;
-
-      const session = DropServer.Session.get(session_id);
-      if (session === undefined || session.disabled !== false)
-        return void res
-          .writeHead(404)
-          .end('{"message":"Session does not exist or is disabled"}');
+      const { req, res, user, session, file_path } = ctx;
 
       let body = '';
       req
@@ -500,35 +556,60 @@ export namespace DropServer.Tasks {
     export async function POST(ctx: Context) {
       assertAuth(ctx);
       assertAuthIsAdmin(ctx);
-      assertSessionId(ctx);
+      const session_id = assertSessionId(ctx);
 
-      const { req, res, session_id, user: auth } = ctx;
+      const { req, res, user } = ctx;
 
-      // io cannot be asynchronous. this queue prevents race conditoons caused by asynchronous execution
-      queue
-        .then(async () => {
-          if (DropServer.Session.exists(session_id))
-            return void res
-              .writeHead(400)
-              .end('{"message":"Cannot create session with same session id"}');
+      let body = '';
+      req
+        .on('data', data => void (body += data))
+        .once('end', () => {
+          const json = assertJson(ctx, body) as Patch.Schema;
+          const keys = Object.keys(json) as (keyof typeof json)[];
+          assertValidSchema(ctx, Patch.Schema.map, keys, Patch.Schema.length);
+          assertPatchSchemaSanitised(ctx, json, keys);
 
-          await DropServer.Session.create(session_id, auth.name);
+          const options: Parameters<typeof DropServer.Session.create>[0] = {
+            uuid: session_id,
+            author: user.name,
+            name: 'Unnamed',
+          };
 
-          res
-            .writeHead(204)
-            .end();
-        })
-        .catch(e => { throw e });
+          // evaluate
+          for (const key of keys) {
+            assert(key in Patch.Schema.map); // offensive programming
+            /* @ts-expect-error */
+            options[key] = json[key];
+          }
+          
+          // io cannot be asynchronous. this queue prevents race conditoons caused by asynchronous execution
+          queue
+            .then(async () => {
+              if (DropServer.Session.exists(session_id))
+                return void res
+                  .writeHead(400)
+                  .end('{"message":"Cannot create session with same session id"}');
+
+              await DropServer.Session.create(options);
+
+              res
+                .writeHead(204)
+                .end();
+            })
+            .catch(e => { throw e });
+        });
     }
 
     export namespace Patch {
       export type Schema = {
         disabled: boolean;
+        name: string;
       };
       export namespace Schema {
         export const map = {
-          'disabled': true,
-        };
+          'disabled': 'boolean',
+          'name': 'string',
+        } as const;
         export const length = Object.keys(map).length;
       }
     }
@@ -552,43 +633,17 @@ export namespace DropServer.Tasks {
           req
             .on('data', data => void (body += data))
             .once('end', () => {
-              let json: Patch.Schema;
-              
-              try {
-                json = JSON.parse(body)
-              } catch {
-                return void res
-                  .writeHead(400)
-                  .end();
-              }
-
+              const json = assertJson(ctx, body) as Patch.Schema;
               const keys = Object.keys(json) as (keyof typeof json)[];
-              // (defensive programming) ensure json does not have more than the expected amount of keys before iterating
-              if (keys.length > Patch.Schema.length)
-                return void res
-                  .writeHead(400)
-                  .end();
-              
-              // validate
-              for (const key of keys) {
-                if (key in Patch.Schema.map) continue;
-
-                return void res
-                  .writeHead(400)
-                  .end();
-              }
+              assertValidSchema(ctx, Patch.Schema.map, keys, Patch.Schema.length);
+              assertPatchSchemaSanitised(ctx, json, keys);
 
               // evaluate
+              const mut_session = DropServer.Session.mutate(session);
               for (const key of keys) {
-                const val = json[key];
-                const mut_session = DropServer.Session.mutate(session);
-                switch (key) {
-                  case 'disabled':
-                    mut_session.disabled = val;
-                    break;
-
-                  default: throw Error('offensive programming');
-                }
+                assert(key in Patch.Schema.map); // offensive programming
+                /* @ts-expect-error */
+                mut_session[key] = json[key];
               }
 
               res
