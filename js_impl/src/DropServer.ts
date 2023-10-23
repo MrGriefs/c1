@@ -11,6 +11,7 @@
  */
 
 import fs from 'node:fs/promises';
+import fs_sync from 'node:fs';
 import path from 'node:path';
 import type http from 'node:http';
 import https from 'node:https';
@@ -22,6 +23,8 @@ import type * as Type from './types';
 import { Fs, Net, exhaust_match, type Only } from './Util.js';
 import { randomUUID } from 'node:crypto';
 import constants from 'node:constants';
+import zlib from 'node:zlib';
+import { pipeline } from 'node:stream/promises';
 
 // enforces all date strings to be in UTC time
 process.env.TZ = 'UTC';
@@ -73,8 +76,8 @@ export namespace DropServer {
   };
   export namespace Context {
     export type Auth = { user: Type.User; };
-    export type Session = { session: Readonly<Type.Session>; };
-    export type FilePath = { file_path: string; };
+    export type Session = { session: Readonly<Type.Session.Enabled>; };
+    export type FilePath = { computed_file_path: string; };
   }
 
   export const store = path.join(process.cwd(), 'data');
@@ -109,7 +112,7 @@ export namespace DropServer.Session {
   const sessions = new Map<Type.Session['uuid'], Type.Session>();
   const location = path.join(store, 'sessions.json');
 
-  export let system: Type.Session | null = null;
+  export let system: Type.Session.Enabled | null = null;
 
   export async function load_state() {
     // ensure file system state
@@ -131,10 +134,10 @@ export namespace DropServer.Session {
         raw.users = new Map();
 
         promises.push(
-          (async () => {
-            for await (const [uid, cred] of read_users(raw.uuid))
+          read_users(raw.uuid).then(users => {
+            for (const [uid, cred] of users)
               (raw.users as Map<string, string>).set(uid, cred);
-          })(),
+          }),
         );
       }
 
@@ -145,43 +148,62 @@ export namespace DropServer.Session {
 
     // ensure system group. the system group is used to store admin users
     const system_uuid = '00000000-0000-0000-0000-000000000000' as Type.Session['uuid'];
-    if (!DropServer.Session.exists(system_uuid))
-      await DropServer.Session.create({
+    if (true !== DropServer.Session.exists(system_uuid))
+      // anything other than true? create or throw
+      await _create({
         uuid: system_uuid,
         author: 'system',
         name: 'System',
       });
 
-    system = DropServer.Session.get(system_uuid);
+    system = DropServer.Session.get(system_uuid) as Type.Session.Enabled;
   }
 
-  export async function* read_users(session_id: Type.Session.Uuid) {
-    const ents = await fs.readdir(path.join(store, session_id), { withFileTypes: true });
-
-    for (const ent of ents) {
-      const parts = ent.name.split(':');
-      assert(parts.length == 2);
-
-      yield parts;
+  namespace ReadUsers {
+    export function* create_generator(ents: fs_sync.Dirent[]) {
+      for (const ent of ents) {
+        const parts = ent.name.split(':');
+        assert(parts.length === 2);
+        
+        yield parts;
+      }
     }
   }
 
-  export async function create(
-    { uuid, author, name, disabled = false }:
+  // async generator creates a promise at every yield. we don't want O(n) overhead from the promise api
+  // use a (non-async generator) resolver instead:
+  export function read_users(session_id: Type.Session.Uuid) {
+    return fs.readdir(path.join(store, session_id), { withFileTypes: true })
+      .then(ReadUsers.create_generator);
+  }
+
+  async function _create(
+    options:
       & Required<Pick<Type.Session, 'uuid' | 'author' | 'name'>>
       & Partial<Pick<Type.Session, 'disabled'>>
   ): Promise<void> {
-    assert(Session.exists(uuid) === false); // offensive programming
-    await fs.mkdir(path.join(store, uuid));
+    let session = options as Type.Session;
+    await fs.mkdir(path.join(store, session.uuid));
+    
+    session.disabled ??= false;
+    session.created = new Date();
 
-    sessions.set(uuid, {
-      uuid,
-      name,
-      author,
-      created: new Date(),
-      disabled,
-      users: new Map() as Type.Session['users'],
-    });
+    if (false === session.disabled)
+      session.users = new Map() as Type.Session.Enabled['users'];
+
+    sessions.set(session.uuid, session);
+  }
+
+  // "safety" wrapper around the internal create function
+  export async function create(options: Omit<Parameters<typeof _create>[0], 'uuid'>): Promise<Type.Session['uuid']> {
+    let session = options as Type.Session;
+
+    do session.uuid = randomUUID() as Type.Session['uuid'];
+    while (exists(session.uuid));
+
+    await _create(session);
+
+    return session.uuid;
   }
 
   export function get(id: Type.Session.Uuid): Readonly<Type.Session> | undefined {
@@ -196,9 +218,18 @@ export namespace DropServer.Session {
   export function is_disabled(session: Type.Session): true | false {
     if (session.disabled === true)
       return true;
+    
+    if (session === system)
+      // system group users must not be un-cached
+      return false;
 
-    if (session.created.valueOf() - new Date().valueOf() > SESSION_OLD_AFTER_DURATION)
-      return session.disabled = true;
+    if (session.created.valueOf() - new Date().valueOf() > SESSION_OLD_AFTER_DURATION) {
+      // free the user map from memory. we don't need them anymore
+      delete session.users;
+      // hack: session is Type.Session.Enabled, so it won't allow assigning
+      // disabled to anything other than false.
+      return session.disabled = true as false;
+    }
 
     return false;
   }
@@ -215,25 +246,25 @@ export namespace DropServer.Session {
 
 export namespace DropServer.Session.User {
   type WritableMap = Map<string, string>;
-  export function add(session: Type.Session, { name, auth }: Type.User) {
+  export function add(session: Type.Session.Enabled, { name, auth }: Type.User) {
     // offensive programming: don't trust all uses of this function to be sequential/synchronous
     assert(!session.users.has(name));
     (session.users as WritableMap).set(name, auth);
   }
 
-  export function remove(session: Type.Session, { name, auth }: Type.User) {
+  export function remove(session: Type.Session.Enabled, { name, auth }: Type.User) {
     const auth2 = session.users.get(name);
     assert(auth2 !== undefined && auth2 === auth);
     (session.users as WritableMap).delete(name);
   }
 
   /** remove a user without the user's credentials, i.e. an admin removing a user on their behalf */
-  export function unsafe_remove(session: Type.Session, { name }: Only<Type.User, 'name'>) {
+  export function unsafe_remove(session: Type.Session.Enabled, { name }: Only<Type.User, 'name'>) {
     assert(session.users.has(name));
     (session.users as WritableMap).delete(name);
   }
 
-  export function is(session: Type.Session, { name, auth }: Type.User): true | false {
+  export function is(session: Type.Session.Enabled, { name, auth }: Type.User): true | false {
     switch (session.users.get(name)) {
       // offensive programming (if credentials were undefined, this function would
       // return true if the username doesn't exist - opening an exploit)
@@ -253,7 +284,7 @@ export namespace DropServer.Session.User {
   }  
 
   /** returns the enum for authentication the user has (authenticity qualification) */
-  export function qualify(session: Type.Session, { name, auth }: Type.User) {
+  export function qualify(session: Type.Session.Enabled, { name, auth }: Type.User): Qualify {
     assert(auth !== undefined);
     const auth2 = session.users.get(name);
     
@@ -265,6 +296,20 @@ export namespace DropServer.Session.User {
       default:
         return Qualify.BAD_AUTH;
     }
+  }
+}
+
+export namespace DropServer.Session.User.File {
+  export function relative_path(session: Type.Session, { name, auth }: Type.User, file_path: string) {
+    return path.join(session.uuid, `${name}:${auth}`, file_path);
+  }
+
+  export function full_path(session: Type.Session, { name, auth }: Type.User, file_path: string) {
+    return path.join(DropServer.store, session.uuid, `${name}:${auth}`, file_path);
+  }
+
+  export function relative_to_full_path(relative: string) {
+    return path.join(DropServer.store, relative);
   }
 }
 
@@ -296,11 +341,12 @@ export namespace DropServer {
   // see https://github.com/microsoft/TypeScript/issues/53715
   const stack = _DropServer_stack;
   const api_map = {
-    '/files': {
-      'POST': Tasks.Upload.POST,
+    '/file': {
+      POST: HttpMethods.File.POST,
     },
     '/session': {
-      'POST': Tasks.Session.POST,
+      POST: HttpMethods.Session.POST,
+      PATCH: HttpMethods.Session.PATCH,
     },
   } as const;
 
@@ -312,6 +358,8 @@ export namespace DropServer {
     // do not trust well-known CAs, only trust our CAs as chainable.
     // this will reject peers with any CA that is not ours
     ca: stack.pop(),
+
+    requestTimeout: 1_000 * 60 * 8,
 
     secureOptions: 0
       | constants.SSL_OP_NO_SSLv2
@@ -358,7 +406,7 @@ export namespace DropServer {
         if (err === undefined) return; // api short-circuit
         console.error(`${req.method} ${req.url}: ${err}`);
 
-        if (res.closed !== true)
+        if (res.closed !== true && res.destroyed !== true)
           res
             .writeHead(500)
             .end();
@@ -368,24 +416,29 @@ export namespace DropServer {
   server.listen(8443);
 }
 
-export namespace DropServer.Tasks {
+export namespace DropServer.HttpMethods {
   import User = DropServer.Session.User;
 
   function assertFilePath(ctx: Context): asserts ctx is Context & Context.FilePath {
     const { req, res } = ctx;
-    const path = req.headers[DropServer.Constants.Headers.XFilePath];
+    let path = req.headers[DropServer.Constants.Headers.XFilePath];
 
     if (
       // headers may contain non-string values in certain cases, as per nodejs http docs
-      typeof path !== 'string' ||
-      path.length === 0 ||
-      path.length > 64
+      typeof path !== 'string' || (
+        path = path.normalize('NFC'),
+        path.length === 0 ||
+        path.length > 64
+      ) || (
+        path = Buffer.from(path, 'utf8').toString('hex'),
+        path.length > 128
+      )
     )
       throw void res
         .writeHead(400)
         .end();
 
-    (ctx as Context & Context.FilePath).file_path = path;
+    (ctx as Context & Context.FilePath).computed_file_path = path;
   }
 
   function assertSessionId(ctx: Context): Type.Session.Uuid {
@@ -411,7 +464,7 @@ export namespace DropServer.Tasks {
         .writeHead(404)
         .end('{"message":"Session does not exist or is disabled"}');
 
-    (ctx as Context & Context.Session).session = session;
+    (ctx as Context & Context.Session).session = session as Type.Session.Enabled;
   }
 
   /** this asserts the existence of authorisation, it does NOT assert authentication validity */
@@ -452,7 +505,7 @@ export namespace DropServer.Tasks {
         .end();
   }
 
-  function assertAuthAsUser({ res, user, session }: Context & Context.Auth & Context.Session) {
+  function assertAuthIsSessionUser({ res, user, session }: Context & Context.Auth & Context.Session) {
     const _ = User.qualify(session, user);
     switch (_) {
       // force typescript to error if this match doesn't include all enum cases
@@ -473,7 +526,7 @@ export namespace DropServer.Tasks {
     }
   }
   
-  function assertJson({ res }: Context, body: string): object {
+  function assertJson<T extends object>({ res }: Context, body: string): T {
     try {
       return JSON.parse(body);
     } catch {
@@ -500,158 +553,247 @@ export namespace DropServer.Tasks {
     }
   }
 
-  function assertPatchSchemaSanitised({ res }: Context, json: Session.Patch.Schema, keys: (keyof typeof Session.Patch.Schema.map)[]) {
-    for (const key of keys) {
-      switch (key) {
-        case 'name': {
-          let v = json[key];
-          if (v.length > 32)
-            return void res
-              .writeHead(400)
-              .end('{"message":"\'name\' must not exceed 32 characters"}');
+  export namespace Mutex {
+    // a forethought mutex implementation
+    const table = new Set<string>(); // string reference table
 
-          v = v.normalize('NFC'); // decrease string length by normaling chars
-          let rebuilt = '';
-          for (let i = 0; i != v.length; ++i) {
-            if (v.charCodeAt(i) < 20) continue;
-            rebuilt = rebuilt + v[i];
-          }
+    export function lock(str: string): boolean {
+      const has = table.has(str);
+      // if the scheduler is able to pause execution here, and run something else,
+      // then this is flawed. but im almost certain that only occurs in between
+      // (async) function calls, which is accounted for correctly
+      table.add(str);
+      return has;
+    }
 
-          if (rebuilt.length === 0)
-            return void res
-              .writeHead(400)
-              .end('{"message":"\'name\' must be at least 1 character in length"}');
-        }
-      }
+    export function unlock(str: string): void {
+      table.delete(str);
     }
   }
 
-  export namespace Upload {
+  export namespace File {
+    // students can upload files 1 GiB or less (anything more than 1 Gibibyte would likely
+    // take too long to send)
+    const CONTENT_LENGTH = 1_024 ** 3;
+
     export function POST(ctx: Context) {
       assertAuth(ctx);
       assertFilePath(ctx);
       assertSession(ctx);
-      assertAuthAsUser(ctx);
+      assertAuthIsSessionUser(ctx);
 
-      const { req, res, user, session, file_path } = ctx;
+      const { req, res, user, session, computed_file_path } = ctx;
+      const rel_path = DropServer.Session.User.File.relative_path(session, user, computed_file_path);
 
-      let body = '';
-      req
-        .on('data', data => void (body += data))
-        .once('end', () => {
+      // this function is executed in the asynchronous
+      // scheduler context, therefore a mutex is needed
+      if (Mutex.lock(rel_path))
+        return res.writeHead(409).end();
 
-        });
+      try {
+        const h_content_length = req.headers['content-length'];
+        if (
+          typeof h_content_length !== 'string' ||
+          +h_content_length > CONTENT_LENGTH
+        )
+          return void res.writeHead(411).end();
+
+        const file_path = DropServer.Session.User.File.relative_to_full_path(rel_path);
+
+        // support for multiple compression algorithms
+        // todo: currently this implementation will keep reading
+        // data even after the 1 GiB limit
+        switch (req.headers['content-encoding']) {
+          case undefined:
+          case '': {
+            req.pipe(fs_sync.createWriteStream(file_path));
+            break;
+          }
+          case 'br':
+            pipeline(req, zlib.createBrotliDecompress(), fs_sync.createWriteStream(file_path))
+              // pipeline() is an async function, and thus is being scheduled outside of this function
+              // (the global scope). we don't want error to escape to the global scope
+              .catch(console.error);
+            break;
+          case 'gzip':
+            pipeline(req, zlib.createGunzip(), fs_sync.createWriteStream(file_path))
+              .catch(console.error);
+            break;
+          case 'deflate':
+            pipeline(req, zlib.createInflate(), fs_sync.createWriteStream(file_path))
+              .catch(console.error);
+            break;
+          default:
+            return void res.writeHead(400).end();
+        }
+
+        req.once('end', () => void res.writeHead(204).end());
+      } finally {
+        Mutex.unlock(rel_path);
+      }
     }
 
-    export function GET(req: http.IncomingMessage, res: http.ServerResponse) {
-      const path = assertFilePath(req, res);
-      const auth = assertAuth(req, res);
+    export function GET(ctx: Context) {
+      assertAuth(ctx);
+      assertFilePath(ctx);
+      assertSession(ctx);
+      assertAuthIsSessionUser(ctx);
 
+      const { req, res, user, session, computed_file_path } = ctx;
+      const rel_path = DropServer.Session.User.File.relative_path(session, user, computed_file_path);
 
+      // mark file as busy
+      if (Mutex.lock(rel_path))
+        return res.writeHead(409).end();
+      
+      try {
+        const file_path = DropServer.Session.User.File.relative_to_full_path(rel_path);
+        if (true !== fs_sync.existsSync(file_path))
+          return res.writeHead(404).end();
+
+        // this is not a compliant accept-encoding parser
+        // see https://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.3
+        switch (req.headers['accept-encoding']) {
+          case undefined:
+          case '': {
+            res.writeHead(200);
+            fs_sync.createReadStream(file_path).pipe(res);
+            break;
+          }
+          case 'br':
+            res.writeHead(200, { 'Content-Encoding': 'br' });
+            pipeline(fs_sync.createReadStream(file_path), zlib.createBrotliCompress(), res)
+              .catch(console.error);
+            break;
+          case 'gzip':
+            res.writeHead(200, { 'Content-Encoding': 'gzip' });
+            pipeline(fs_sync.createReadStream(file_path), zlib.createGzip(), res)
+              .catch(console.error);
+            break;
+          case 'deflate':
+            res.writeHead(200, { 'Content-Encoding': 'deflate' });
+            pipeline(fs_sync.createReadStream(file_path), zlib.createDeflate(), res)
+              .catch(console.error);
+            break;
+          default:
+            return void res.writeHead(400).end();
+        }
+      } finally {
+        Mutex.unlock(rel_path);
+      }
     }
   }
 
   export namespace Session {
-    const queue = Promise.resolve();
-    export async function POST(ctx: Context) {
+    type Schema = {
+      disabled: boolean;
+      name: string;
+    };
+    namespace Schema {
+      export const map = {
+        'disabled': 'boolean',
+        'name': 'string',
+      } as const;
+      export const length = Object.keys(map).length;
+
+      export function assertSanitised({ res }: Context, json: Schema, keys: (keyof typeof Schema.map)[]) {
+        for (const key of keys) {
+          switch (key) {
+            case 'name': {
+              let v = json[key];
+              if (v.length > 32)
+                return void res
+                  .writeHead(400)
+                  .end('{"message":"\'name\' must not exceed 32 characters"}');
+
+              v = v.normalize('NFC'); // decrease string length by normaling chars
+              let rebuilt = '';
+              for (let i = 0; i != v.length; ++i) {
+                if (v.charCodeAt(i) < 20) continue;
+                rebuilt = rebuilt + v[i];
+              }
+
+              if (rebuilt.length === 0)
+                return void res
+                  .writeHead(400)
+                  .end('{"message":"\'name\' must be at least 1 character in length"}');
+            }
+          }
+        }
+      }
+    }
+
+    export function POST(ctx: Context) {
       assertAuth(ctx);
       assertAuthIsAdmin(ctx);
-      const session_id = assertSessionId(ctx);
 
       const { req, res, user } = ctx;
 
       let body = '';
       req
+        .setEncoding('utf8')
         .on('data', data => void (body += data))
         .once('end', () => {
-          const json = assertJson(ctx, body) as Patch.Schema;
+          const json = assertJson<Schema>(ctx, body);
           const keys = Object.keys(json) as (keyof typeof json)[];
-          assertValidSchema(ctx, Patch.Schema.map, keys, Patch.Schema.length);
-          assertPatchSchemaSanitised(ctx, json, keys);
+          assertValidSchema(ctx, Schema.map, keys, Schema.length);
+          Schema.assertSanitised(ctx, json, keys);
 
           const options: Parameters<typeof DropServer.Session.create>[0] = {
-            uuid: session_id,
             author: user.name,
             name: 'Unnamed',
           };
 
           // evaluate
           for (const key of keys) {
-            assert(key in Patch.Schema.map); // offensive programming
+            assert(key in Schema.map); // offensive programming
             /* @ts-expect-error */
             options[key] = json[key];
           }
           
-          // io cannot be asynchronous. this queue prevents race conditoons caused by asynchronous execution
-          queue
-            .then(async () => {
-              if (DropServer.Session.exists(session_id))
-                return void res
-                  .writeHead(400)
-                  .end('{"message":"Cannot create session with same session id"}');
+          const session_id = DropServer.Session.create(options);
 
-              await DropServer.Session.create(options);
-
-              res
-                .writeHead(204)
-                .end();
-            })
-            .catch(e => { throw e });
+          res
+            .writeHead(200)
+            .end(`{"session_id":"${session_id}"}`);
         });
     }
 
-    export namespace Patch {
-      export type Schema = {
-        disabled: boolean;
-        name: string;
-      };
-      export namespace Schema {
-        export const map = {
-          'disabled': 'boolean',
-          'name': 'string',
-        } as const;
-        export const length = Object.keys(map).length;
-      }
-    }
-
-    export async function PATCH(ctx: Context) {
+    export function PATCH(ctx: Context) {
       assertAuth(ctx);
       assertAuthIsAdmin(ctx); // is admin, don't need to authenticate
       assertSession(ctx);
 
       const { req, res, session } = ctx;
+      
+      if (true !== DropServer.Session.exists(session.uuid))
+        return void res.writeHead(404).end();
 
-      // io cannot be asynchronous. this queue prevents race conditoons where the directory is deleted after checking it exists
-      queue
-        .then(async () => {
-          if (!DropServer.Session.exists(session.uuid))
-            return void res
-              .writeHead(500) // should resource race be 500???
-              .end('{"message":"Session deleted before operation"}');
-          
-          let body = '';
-          req
-            .on('data', data => void (body += data))
-            .once('end', () => {
-              const json = assertJson(ctx, body) as Patch.Schema;
-              const keys = Object.keys(json) as (keyof typeof json)[];
-              assertValidSchema(ctx, Patch.Schema.map, keys, Patch.Schema.length);
-              assertPatchSchemaSanitised(ctx, json, keys);
+      let body = '';
+      req
+        .setEncoding('utf8')
+        .on('data', data => void (body += data))
+        .once('end', () => {
+          const json = assertJson<Schema>(ctx, body);
+          const keys = Object.keys(json) as (keyof typeof json)[];
+          assertValidSchema(ctx, Schema.map, keys, Schema.length);
+          Schema.assertSanitised(ctx, json, keys);
 
-              // evaluate
-              const mut_session = DropServer.Session.mutate(session);
-              for (const key of keys) {
-                assert(key in Patch.Schema.map); // offensive programming
-                /* @ts-expect-error */
-                mut_session[key] = json[key];
-              }
+          if (true !== DropServer.Session.exists(session.uuid))
+            return void res.writeHead(404).end();
 
-              res
-                .writeHead(200, JSON.stringify(session))
-                .end();
-            });
+          // evaluate
+          const mut_session = DropServer.Session.mutate(session);
+          for (const key of keys) {
+            assert(key in Schema.map); // offensive programming
+            /* @ts-expect-error */
+            mut_session[key] = json[key];
+          }
+
+          res
+            .writeHead(200, JSON.stringify(session))
+            .end();
         })
-        .catch(e => { throw e });
     }
 
     // todo: DELETE method

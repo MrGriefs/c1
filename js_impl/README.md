@@ -26,7 +26,7 @@ From current working directory;
   - Usernames are required to be unique in the specific User Group only.  
   - However, usernames are NOT unique from the admin User Group  
     (i.e. to upload in a User Group with the username of an admin, the admin's credentials must be used).
-  - File names are URI encoded for simplicity.
+  - File names are hex encoded for simplicity and compatibility.
 - `/data/sessions/00000000-0000-0000-0000-000000000000/...`  
   an internal User Group - used to store credentials of administrators. also may be used to share files between administrators.  
   this is the only User Group that usernames conflict with other User Groups.
@@ -80,3 +80,6 @@ Resources that were used when researching problems encountered during this proje
 1. Node.js HTTPS and TLS documentation
    - <https://nodejs.org/api/https.html>
    - <https://nodejs.org/api/tls.html>
+1. Using Node.js zlib and stream modules for compressing/decompressing payloads
+   - <https://nodejs.org/api/zlib.html>
+   - <https://nodejs.org/api/stream.html>
