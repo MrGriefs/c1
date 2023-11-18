@@ -3,6 +3,12 @@
 
 # javascript implmentation
 
+## dependencies
+
+- `undici` - a modern http client that is faster than Node.js' built-in `node:http` module http requests.
+- `re2` - a Node.js binding for Google's [re2](https://github.com/google/re2) safe RegExp engine.  
+  Used for ReDoS protection and more performant RegExp evaluations.
+
 ## requirements
 
 - Node.js v12 or above

@@ -25,6 +25,7 @@ import { randomUUID } from 'node:crypto';
 import constants from 'node:constants';
 import zlib from 'node:zlib';
 import { pipeline } from 'node:stream/promises';
+import { Re2 } from './Re2.js';
 
 // enforces all date strings to be in UTC time
 process.env.TZ = 'UTC';
@@ -130,16 +131,8 @@ export namespace DropServer.Session {
       raw.disabled ||= raw.created.valueOf() > min_date;
 
       // pre-cache users of active User Groups
-      if (raw.disabled === false) {
-        raw.users = new Map();
-
-        promises.push(
-          read_users(raw.uuid).then(users => {
-            for (const [uid, cred] of users)
-              (raw.users as Map<string, string>).set(uid, cred);
-          }),
-        );
-      }
+      if (raw.disabled === false)
+        promises.push(_instantiate(raw));
 
       sessions.set(raw.uuid, raw);
     }
@@ -177,12 +170,8 @@ export namespace DropServer.Session {
       .then(ReadUsers.create_generator);
   }
 
-  async function _create(
-    options:
-      & Required<Pick<Type.Session, 'uuid' | 'author' | 'name'>>
-      & Partial<Pick<Type.Session, 'disabled'>>
-  ): Promise<void> {
-    let session = options as Type.Session;
+  async function _create(options: Only<Type.Session, 'uuid' | 'author' | 'name'>): Promise<void> {
+    const session = options as Type.Session;
     await fs.mkdir(path.join(store, session.uuid));
     
     session.disabled ??= false;
@@ -196,7 +185,7 @@ export namespace DropServer.Session {
 
   // "safety" wrapper around the internal create function
   export async function create(options: Omit<Parameters<typeof _create>[0], 'uuid'>): Promise<Type.Session['uuid']> {
-    let session = options as Type.Session;
+    const session = options as Type.Session;
 
     do session.uuid = randomUUID() as Type.Session['uuid'];
     while (exists(session.uuid));
@@ -214,6 +203,44 @@ export namespace DropServer.Session {
   export function mutate(session: Readonly<Type.Session>): Type.Session {
     return session; // noop
   }
+  
+  /** instantiate a Session.Enabled object */
+  async function _instantiate(session: Type.Session.Enabled): Promise<void> {
+    session.users = new Map();
+
+    // pre-cache the re2 object
+    const { file_name_regexp } = session;
+    if (undefined !== file_name_regexp)
+      if (true !== Re2.add(file_name_regexp))
+        // what?
+        delete session.file_name_regexp;
+
+    return read_users(session.uuid).then(users => {
+      for (const [uid, cred] of users)
+        (session.users as Map<string, string>).set(uid, cred);
+    });
+  }
+
+  /** disable a Session at runtime, i.e. on user demand */
+  export function disable(session: Type.Session.Enabled): void {
+    // typecast session to Disabled so we may mutate it with the appropriate type definition
+    const _ = session as unknown as Type.Session.Disabled;
+    // free the user map from memory. we don't need them anymore
+    delete session.users;
+    _.disabled = true;
+
+    const { file_name_regexp } = session;
+    if (undefined !== file_name_regexp)
+      // remove the re2 object from cache
+      Re2.remove(file_name_regexp);
+  }
+
+  /** enable a Session at runtime, i.e. on user demand */
+  export function enable(session: Type.Session.Disabled): Promise<void> {
+    const _ = session as unknown as Type.Session.Enabled;
+    _.disabled = false;
+    return _instantiate(_);
+  }
 
   export function is_disabled(session: Type.Session): true | false {
     if (session.disabled === true)
@@ -223,13 +250,8 @@ export namespace DropServer.Session {
       // system group users must not be un-cached
       return false;
 
-    if (session.created.valueOf() - new Date().valueOf() > SESSION_OLD_AFTER_DURATION) {
-      // free the user map from memory. we don't need them anymore
-      delete session.users;
-      // hack: session is Type.Session.Enabled, so it won't allow assigning
-      // disabled to anything other than false.
-      return session.disabled = true as false;
-    }
+    if (session.created.valueOf() - new Date().valueOf() > SESSION_OLD_AFTER_DURATION)
+      return disable(session), true;
 
     return false;
   }
@@ -301,15 +323,27 @@ export namespace DropServer.Session.User {
 
 export namespace DropServer.Session.User.File {
   export function relative_path(session: Type.Session, { name, auth }: Type.User, file_path: string) {
-    return path.join(session.uuid, `${name}:${auth}`, file_path);
+    return (
+      session.uuid
+      + path.sep + `${name}:${auth}`
+      + path.sep + file_path
+    );
   }
 
   export function full_path(session: Type.Session, { name, auth }: Type.User, file_path: string) {
-    return path.join(DropServer.store, session.uuid, `${name}:${auth}`, file_path);
+    return (
+      DropServer.store
+      + path.sep + session.uuid
+      + path.sep + `${name}:${auth}`
+      + path.sep + file_path
+    );
   }
 
   export function relative_to_full_path(relative: string) {
-    return path.join(DropServer.store, relative);
+    return (
+      DropServer.store
+      + path.sep + relative
+    );
   }
 }
 
@@ -460,7 +494,7 @@ export namespace DropServer.HttpMethods {
     const session = DropServer.Session.get(uuid);
 
     if (session === undefined || DropServer.Session.is_disabled(session))
-      return void res
+      throw void res
         .writeHead(404)
         .end('{"message":"Session does not exist or is disabled"}');
 
@@ -530,7 +564,7 @@ export namespace DropServer.HttpMethods {
     try {
       return JSON.parse(body);
     } catch {
-      return void res
+      throw void res
         .writeHead(400)
         .end();
     }
@@ -539,7 +573,7 @@ export namespace DropServer.HttpMethods {
   function assertValidSchema({ res }: Context, map: object, keys: string[], length: number): void {
     // (defensive programming) ensure json does not have more than the expected amount of keys before iterating
     if (keys.length > length)
-      return void res
+      throw void res
         .writeHead(400)
         .end();
     
@@ -547,7 +581,7 @@ export namespace DropServer.HttpMethods {
     for (const key of keys) {
       if (key in map && typeof key === map[key]) continue;
 
-      return void res
+      throw void res
         .writeHead(400)
         .end();
     }
@@ -590,47 +624,48 @@ export namespace DropServer.HttpMethods {
       if (Mutex.lock(rel_path))
         return res.writeHead(409).end();
 
-      try {
-        const h_content_length = req.headers['content-length'];
-        if (
-          typeof h_content_length !== 'string' ||
-          +h_content_length > CONTENT_LENGTH
-        )
-          return void res.writeHead(411).end();
+      const h_content_length = req.headers['content-length'];
+      if (
+        typeof h_content_length !== 'string' ||
+        +h_content_length > CONTENT_LENGTH
+      )
+        return void res.writeHead(411).end();
 
-        const file_path = DropServer.Session.User.File.relative_to_full_path(rel_path);
+      const file_path = DropServer.Session.User.File.relative_to_full_path(rel_path);
 
-        // support for multiple compression algorithms
-        // todo: currently this implementation will keep reading
-        // data even after the 1 GiB limit
-        switch (req.headers['content-encoding']) {
-          case undefined:
-          case '': {
-            req.pipe(fs_sync.createWriteStream(file_path));
-            break;
-          }
-          case 'br':
-            pipeline(req, zlib.createBrotliDecompress(), fs_sync.createWriteStream(file_path))
-              // pipeline() is an async function, and thus is being scheduled outside of this function
-              // (the global scope). we don't want error to escape to the global scope
-              .catch(console.error);
-            break;
-          case 'gzip':
-            pipeline(req, zlib.createGunzip(), fs_sync.createWriteStream(file_path))
-              .catch(console.error);
-            break;
-          case 'deflate':
-            pipeline(req, zlib.createInflate(), fs_sync.createWriteStream(file_path))
-              .catch(console.error);
-            break;
-          default:
-            return void res.writeHead(400).end();
+      // support for multiple compression algorithms
+      // todo: currently this implementation will keep reading
+      // data even after the 1 GiB limit
+      let promise: Promise<any>;
+      switch (req.headers['content-encoding']) {
+        case undefined:
+        case '': {
+          promise = pipeline(req, fs_sync.createWriteStream(file_path));
+          break;
         }
-
-        req.once('end', () => void res.writeHead(204).end());
-      } finally {
-        Mutex.unlock(rel_path);
+        case 'br':
+          promise = pipeline(req, zlib.createBrotliDecompress(), fs_sync.createWriteStream(file_path))
+            // pipeline() is an async function, and thus is being scheduled outside of this function
+            // (the global scope). we don't want error to escape to the global scope
+            .catch(console.error);
+          break;
+        case 'gzip':
+          promise = pipeline(req, zlib.createGunzip(), fs_sync.createWriteStream(file_path))
+            .catch(console.error);
+          break;
+        case 'deflate':
+          promise = pipeline(req, zlib.createInflate(), fs_sync.createWriteStream(file_path))
+            .catch(console.error);
+          break;
+        default:
+          return void res.writeHead(400).end();
       }
+
+      promise
+        .catch(console.error)
+        .finally(() => void Mutex.unlock(rel_path));
+
+      req.once('end', () => void res.writeHead(204).end());
     }
 
     export function GET(ctx: Context) {
@@ -693,6 +728,7 @@ export namespace DropServer.HttpMethods {
       export const map = {
         'disabled': 'boolean',
         'name': 'string',
+        'file_name_regexp': 'string',
       } as const;
       export const length = Object.keys(map).length;
 
@@ -716,7 +752,21 @@ export namespace DropServer.HttpMethods {
               if (rebuilt.length === 0)
                 return void res
                   .writeHead(400)
-                  .end('{"message":"\'name\' must be at least 1 character in length"}');
+                  .end('{"message":"\'${key}\' must be at least 1 character in length"}');
+
+              json[key] = rebuilt;
+              break;
+            }
+            case 'file_name_regexp': {
+              // redos protection
+              const success = Re2.add(json[key]);
+
+              if (true !== success)
+                return void res
+                  .writeHead(400)
+                  .end('{"message":"\'${key}\' is an invalid or unacceptable regexp"}');
+
+              break;
             }
           }
         }

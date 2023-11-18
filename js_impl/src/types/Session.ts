@@ -3,6 +3,8 @@ export type Session = {
   name: string;
   created: Date;
   author: string;
+  /** a regular expression to validate against file names */
+  file_name_regexp?: string;
 } & (
   | { disabled: true }
   | {
